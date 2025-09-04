@@ -31,7 +31,8 @@ pip install -r requirements.txt
 streamlit run app.py
 
 
-<b>System Workflow Flowchart</b>
+## System Workflow Flowchart 
+
 Farmer Login
      │
      ▼
