@@ -16,6 +16,11 @@ Designed for scalable MRV in smallholder farming systems, the app integrates AI 
 
 ---
 
+## app can be seen on 
+
+[text](https://agriconnect-mrv-qusay-saify.streamlit.app/)
+
+
 ## Installation
 
 1. **Clone the repository**

@@ -1,8 +1,8 @@
 # app.py
 """
 AgriConnect-MRV — Deployment-safe Streamlit app
-Keeps original UI/UX and features intact.
-Heuristic image detection used (no torch) so Streamlit Cloud deployment succeeds.
+Farmer-friendly MRV — AI detection (heuristic), crop suggestions, modern techniques & notifications
+No heavy ML frameworks, runs on basic Streamlit hosting 
 """
 
 import streamlit as st
@@ -43,7 +43,7 @@ def save_image_bytes(img_bytes, name=None):
     return name
 
 # --- Lightweight heuristic "AI" detection (no torch) ---
-CROP_LABELS = ["Wheat", "Rice", "Millet", "Maize", "Sugarcane", "Unknown"]
+CROP_LABELS = ["Wheat", "Rice", "Millet", "Maize", "Sugarcane","pulse" "Unknown"]
 
 def detect_image_heuristic(pil_img: Image.Image):
     img = pil_img.convert("RGB")
@@ -299,7 +299,7 @@ else:
                     st.markdown("Weather data not available for your location.")
                 st.markdown("**Modern Techniques:**")
                 st.markdown("- Drip irrigation\n- Organic fertilization\n- Integrated Pest Management (IPM)\n- Soil testing & balanced fertilizer use")
-                st.video("https://www.youtube.com/watch?v=FzC1LPXxYDM")
+                st.video("https://youtu.be/nNP4o1wE6Vo")
 
             elif page=="Government Schemes":
                 st.markdown("<div class='title'>🏛️ Government Schemes</div>", unsafe_allow_html=True)
