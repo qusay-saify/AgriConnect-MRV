@@ -1,32 +1,39 @@
-# app_agri_final_fixed.py
-import streamlit as st
-from PIL import Image
-import pandas as pd
-import numpy as np
-import os, uuid, io, base64
-from datetime import datetime
-import requests
-from torchvision import transforms
-from torchvision.models import mobilenet_v2
-import torch
+# app.py
+"""
+AgriConnect-MRV — Deployment-safe Streamlit app
+Keeps original UI/UX and features intact.
+Heuristic image detection used (no torch) so Streamlit Cloud deployment succeeds.
+"""
 
-# ------------------- CONFIG -------------------
-st.set_page_config(page_title="AgriConnect MRV", page_icon="🌾", layout="wide")
+import streamlit as st
+from PIL import Image, ImageFilter
+import numpy as np
+import pandas as pd
+import requests
+import os, io, uuid, base64
+from datetime import datetime
+
+# --- Config ---
+st.set_page_config(page_title="AgriConnect-MRV", page_icon="🌾", layout="wide")
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 SUB_CSV = os.path.join(DATA_DIR, "submissions.csv")
 
-# ------------------- STORAGE -------------------
+# --- Storage helpers ---
 def init_storage():
     if not os.path.exists(SUB_CSV):
         pd.DataFrame(columns=[
             "submission_id","farmer_id","farmer_name","state","timestamp",
-            "image_name","detected_crop","detected_health","notes","verified","verifier","verify_ts"
+            "image_name","detected_crop","detected_health","confidence","notes","verified","verifier","verify_ts"
         ]).to_csv(SUB_CSV, index=False)
 init_storage()
 
-def load_subs(): return pd.read_csv(SUB_CSV)
-def save_subs(df): df.to_csv(SUB_CSV, index=False)
+def load_subs():
+    return pd.read_csv(SUB_CSV)
+
+def save_subs(df):
+    df.to_csv(SUB_CSV, index=False)
+
 def save_image_bytes(img_bytes, name=None):
     if not name:
         name = f"{uuid.uuid4().hex}.jpg"
@@ -35,75 +42,94 @@ def save_image_bytes(img_bytes, name=None):
         f.write(img_bytes)
     return name
 
-# ------------------- MODEL -------------------
-@st.cache_resource
-def load_model():
-    model = mobilenet_v2(pretrained=True)
-    model.eval()
-    return model
-model = load_model()
+# --- Lightweight heuristic "AI" detection (no torch) ---
+CROP_LABELS = ["Wheat", "Rice", "Millet", "Maize", "Sugarcane", "Unknown"]
 
-transform = transforms.Compose([
-    transforms.Resize((224,224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-])
+def detect_image_heuristic(pil_img: Image.Image):
+    img = pil_img.convert("RGB")
+    small = img.resize((224, 224))
+    arr = np.array(small).astype(np.float32)
 
-IMAGENET_LABELS = {0: "Wheat", 1: "Rice", 2: "Millet", 3:"Maize", 4:"Sugarcane"} # demo
+    r, g, b = arr[...,0], arr[...,1], arr[...,2]
+    green_mask = (g > r) & (g > b) & (g > 100)
+    green_ratio = float(np.sum(green_mask) / (224*224))
 
-def detect_image(image: Image.Image):
-    image = image.resize((224,224))  # Resize for speed
-    img = transform(image).unsqueeze(0)
-    with torch.no_grad():
-        out = model(img)
-        pred = out.argmax(dim=1).item()
-    crop = IMAGENET_LABELS.get(pred, "Unknown Plant")
-    health = "Healthy"  # demo
-    confidence = round(torch.softmax(out, dim=1)[0][pred].item(),2)
-    return {"crop":crop,"health":health,"confidence":confidence}
+    luminance = 0.2126*r + 0.7152*g + 0.0722*b
+    brightness = float(np.mean(luminance) / 255.0)
 
-# ------------------- WEATHER & CROP SUGGESTION -------------------
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    sat = float(np.mean((mx - mn) / (mx + 1e-6)))
+
+    edges = np.array(small.convert("L").filter(ImageFilter.FIND_EDGES))
+    edge_density = float(np.mean(edges > 25))
+
+    score = {}
+    score["Rice"] = 2.5*green_ratio + 1.0*sat - 1.5*edge_density - 0.5*brightness
+    score["Wheat"] = 1.2*green_ratio + 0.8*edge_density + 0.2*brightness - 0.3*sat
+    score["Millet"] = 0.6*green_ratio + 0.6*brightness - 0.8*sat - 0.2*edge_density
+    score["Maize"] = 1.8*green_ratio + 1.1*edge_density + 0.3*sat
+    score["Sugarcane"] = 2.0*green_ratio + 1.5*sat + 0.8*edge_density
+
+    top_crop, raw = max(score.items(), key=lambda x: x[1])
+    conf = 0.5 + (np.tanh(raw) + 1)/2 * 0.48
+    conf = float(np.clip(conf, 0.35, 0.99))
+
+    health = "Healthy"
+    if edge_density > 0.18:
+        health = "Possible Pest / Disease"
+    elif edge_density > 0.12 and (brightness < 0.25 or brightness > 0.9):
+        health = "Stressed / Possible Disease"
+
+    return {"crop": top_crop, "health": health, "confidence": round(conf,2),
+            "green_ratio": round(green_ratio,3), "edge_density": round(edge_density,3),
+            "brightness": round(brightness,2)}
+
+# --- Weather & suggestion ---
 STATE_COORDS = {
-    "Andhra Pradesh": (15.9129,79.74),
-    "Bihar": (25.0961,85.3131),
-    "Karnataka": (15.3173,75.7139),
-    "Maharashtra": (19.7515,75.7139),
-    "Tamil Nadu": (11.1271,78.6569),
-    "Uttar Pradesh": (26.8467,80.9462),
+    "Andhra Pradesh": (15.9129,79.74), "Bihar": (25.0961,85.3131), "Karnataka": (15.3173,75.7139),
+    "Maharashtra": (19.7515,75.7139), "Tamil Nadu": (11.1271,78.6569), "Uttar Pradesh": (26.8467,80.9462),
     "Other": (20.5937,78.9629)
 }
 
 def get_weather_data(latitude, longitude):
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true"
-        response = requests.get(url)
-        data = response.json()
-        return data
-    except:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true&timezone=Asia%2FKolkata"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
         return None
 
-def suggest_crop(weather_data):
+def suggest_crop_from_weather(weather_data):
     try:
-        temp = weather_data['current_weather'].get('temperature', 0)
-        rainfall = weather_data['current_weather'].get('precipitation', 0)
-
-        if rainfall > 200 and 25 <= temp <= 35:
+        cw = weather_data.get("current_weather", {})
+        temp = cw.get("temperature", None)
+        prec = cw.get("precipitation", cw.get("rain", 0) or 0)
+        if temp is None:
+            return "Data insufficient"
+        temp = float(temp); prec = float(prec)
+        if prec > 8 and 25 <= temp <= 35:
             return "Rice"
-        elif 10 <= temp <= 20:
+        if 10 <= temp <= 20:
             return "Wheat"
-        elif 20 <= temp <= 30 and rainfall < 150:
+        if 20 <= temp <= 30 and prec < 6:
             return "Maize"
-        else:
-            return "Crop data unavailable for current conditions"
-    except:
-        return "Weather data unavailable"
+        if temp >= 28 and prec < 4:
+            return "Millet"
+        if prec > 5 and temp > 25:
+            return "Sugarcane"
+        return "Mixed / Local Crop Recommended"
+    except Exception:
+        return "Unavailable"
 
-# ------------------- CSS / THEME -------------------
+# --- CSS / styling (preserve your UI look) ---
 st.markdown("""
 <style>
-* { color: #008c00 !important; font-weight: 700 !important; }
+* { color: #0B3D0B !important; font-weight: 700 !important; }
 .stTextInput input, .stTextArea textarea, .stSelectbox select, .stFileUploader input {
-    color: #ffffff !important; 
+    color: #ffffff !important;
     background-color: #0B3D0B !important;
     font-weight:700 !important;
     border-radius:8px !important;
@@ -118,12 +144,9 @@ input::placeholder, textarea::placeholder { color: #dddddd !important; opacity:1
     border-radius:12px !important;
     padding: 10px 25px !important;
     box-shadow: 0 4px 12px rgba(0,0,0,0.25) !important;
-    transition: all 0.2s ease;
+    transition: all 0.15s ease;
 }
-.stButton>button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 16px rgba(0,0,0,0.35) !important;
-}
+.stButton>button:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.35) !important; }
 .sidebar * { color: #0B3D0B !important; font-weight:700 !important; }
 .stApp { background: linear-gradient(180deg,#fbf9ef,#f2f7f0); }
 .card { background: #fff; border-radius:12px; padding:14px; box-shadow: 0 6px 18px rgba(0,0,0,0.06); margin-bottom:12px; }
@@ -132,38 +155,36 @@ input::placeholder, textarea::placeholder { color: #dddddd !important; opacity:1
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------- SESSION -------------------
+# --- Session state defaults ---
 if "user" not in st.session_state: st.session_state.user = None
 if "uploaded_image" not in st.session_state: st.session_state.uploaded_image = None
 if "analyze_result" not in st.session_state: st.session_state.analyze_result = None
 if "notification" not in st.session_state: st.session_state.notification = []
 
-# ------------------- STATES -------------------
 INDIAN_STATES = ["Andhra Pradesh","Arunachal Pradesh","Assam","Bihar","Chhattisgarh","Goa","Gujarat","Haryana",
                  "Himachal Pradesh","Jharkhand","Karnataka","Kerala","Madhya Pradesh","Maharashtra","Manipur",
                  "Meghalaya","Mizoram","Nagaland","Odisha","Punjab","Rajasthan","Sikkim","Tamil Nadu",
                  "Telangana","Tripura","Uttar Pradesh","Uttarakhand","West Bengal","Other"]
 
-# ------------------- LANDING PAGE -------------------
+# --- Landing / Sign-in ---
 if st.session_state.user is None:
     st.markdown("<div class='title'>🌾 AgriConnect MRV</div>", unsafe_allow_html=True)
-    st.markdown("<div class='small-muted'>Farmer-friendly MRV — AI detection, crop suggestions, modern techniques & notifications</div>", unsafe_allow_html=True)
+    st.markdown("<div class='small-muted'>Farmer-friendly MRV — AI detection (heuristic), crop suggestions, modern techniques & notifications</div>", unsafe_allow_html=True)
     st.markdown("---")
-    
+
     role = st.selectbox("I am a", ["Farmer","Official"])
-    name = st.text_input("Name")
-    
-    if role=="Farmer":
-        state = st.selectbox("State", INDIAN_STATES)
+    name = st.text_input("Name", value="")
+    if role == "Farmer":
+        state = st.selectbox("State", INDIAN_STATES, index=INDIAN_STATES.index("Other"))
         lang = st.radio("Language", ["English","हिंदी"], horizontal=True)
         password = None
     else:
-        password = st.text_input("Password", type="password")
+        password = st.text_input("Official Password (demo)", type="password")
         state = None
         lang = "en"
-    
+
     if st.button("Sign in"):
-        if not name:
+        if not name.strip():
             st.error("Please enter your name")
         else:
             uid = (("F" if role=="Farmer" else "O") + "-" + base64.urlsafe_b64encode(name.encode()).decode()[:8])
@@ -171,11 +192,11 @@ if st.session_state.user is None:
             st.success(f"Signed in as {name} ({uid})")
             st.rerun()
 
-# ------------------- MAIN APP -------------------
+# --- Main app ---
 else:
     user = st.session_state.user
     sidebar, main = st.columns([1,4])
-    
+
     with sidebar:
         st.markdown(f"**{user['name']}** ({user['id']})")
         st.markdown(f"Role: {user['role']}")
@@ -185,15 +206,16 @@ else:
         else:
             page = st.radio("Menu", ["Pending Verifications","Verified Records","Logout"], index=0)
         st.markdown("---")
-    
+
     with main:
         df = load_subs()
-        # ------------------- FARMER -------------------
+
+        # Farmer pages
         if user['role']=="Farmer":
             if page=="Logout":
                 st.session_state.user = None
                 st.rerun()
-            
+
             elif page=="Upload Image":
                 st.markdown("<div class='title'>📸 Upload Farm Photo</div>", unsafe_allow_html=True)
                 uploaded = st.file_uploader("Choose an image (jpg/png)", type=["jpg","png","jpeg"])
@@ -201,17 +223,20 @@ else:
                     st.session_state.uploaded_image = uploaded.getvalue()
                     image = Image.open(io.BytesIO(st.session_state.uploaded_image)).convert("RGB")
                     st.image(image, caption="Preview", use_column_width=True)
+
                 if st.button("Analyze Image"):
                     if not st.session_state.uploaded_image:
                         st.error("Upload image first")
                     else:
                         image = Image.open(io.BytesIO(st.session_state.uploaded_image)).convert("RGB")
-                        res = detect_image(image)
+                        res = detect_image_heuristic(image)
                         st.session_state.analyze_result = res
                         st.success(f"Detected: {res['crop']} (conf {res['confidence']})")
+
                 if st.session_state.analyze_result:
                     res = st.session_state.analyze_result
-                    st.markdown(f"**Crop:** {res['crop']}  |  **Health:** {res['health']}")
+                    st.markdown(f"**Crop:** {res['crop']}  |  **Health:** {res['health']}  | Confidence: {res['confidence']}")
+                    st.markdown(f"**Diagnostics:** GreenRatio={res['green_ratio']} EdgeDensity={res['edge_density']} Brightness={res['brightness']}")
                     notes = st.text_area("Notes (optional)")
                     if st.button("Submit Observation"):
                         img_name = save_image_bytes(st.session_state.uploaded_image)
@@ -224,6 +249,7 @@ else:
                             "image_name": img_name,
                             "detected_crop": res['crop'],
                             "detected_health": res['health'],
+                            "confidence": res['confidence'],
                             "notes": notes,
                             "verified": "Pending",
                             "verifier": "",
@@ -233,29 +259,22 @@ else:
                         save_subs(df)
                         st.success("Submitted — pending verification")
                         st.balloons()
-            
-            elif page=="Crop Info":
-                st.markdown("<div class='title'>🌱 Crop Suggestions & Modern Techniques</div>", unsafe_allow_html=True)
-                # Weather & crop suggestion
-                coords = STATE_COORDS.get(user['state'], STATE_COORDS["Other"])
-                weather_data = get_weather_data(*coords)
-                
-                if weather_data and 'current_weather' in weather_data:
-                    temp = weather_data['current_weather'].get('temperature', 'N/A')
-                    prec = weather_data['current_weather'].get('precipitation', 0)  # safe default
-                    st.markdown(f"**Current Temperature:** {temp}°C | **Precipitation:** {prec}mm")
-                    suggested_crop = suggest_crop(weather_data)
-                    st.markdown(f"**Recommended Crop:** {suggested_crop}")
-                    st.markdown("**Reason:** Based on region, current weather and forecast")
+
+            elif page=="My Submissions":
+                st.markdown("<div class='title'>📁 My Submissions</div>", unsafe_allow_html=True)
+                my = df[df['farmer_id']==user['id']].sort_values(by="timestamp", ascending=False)
+                if my.empty:
+                    st.info("No submissions yet.")
                 else:
-                    st.markdown("Weather data not available for your location.")
-                
-                st.markdown("**Modern Techniques:**")
-                st.markdown("- Drip irrigation")
-                st.markdown("- Organic fertilization")
-                st.markdown("- Pest management")
-                st.video("https://www.youtube.com/watch?v=FzC1LPXxYDM")
-            
+                    for idx, r in my.iterrows():
+                        st.markdown(f"**{r['timestamp']}** — Crop: {r['detected_crop']} | Health: {r['detected_health']} | Status: {r['verified']}")
+                        imgpath = os.path.join(DATA_DIR, r['image_name']) if r['image_name'] else None
+                        if imgpath and os.path.exists(imgpath):
+                            st.image(imgpath, width=350)
+                        if r.get("notes",""):
+                            st.markdown(f"Notes: {r['notes']}")
+                        st.markdown("---")
+
             elif page=="Notifications":
                 st.markdown("<div class='title'>🔔 Notifications</div>", unsafe_allow_html=True)
                 if not st.session_state.notification:
@@ -263,7 +282,25 @@ else:
                 else:
                     for note in st.session_state.notification:
                         st.markdown(f"- {note}")
-            
+
+            elif page=="Crop Info":
+                st.markdown("<div class='title'>🌱 Crop Suggestions & Modern Techniques</div>", unsafe_allow_html=True)
+                coords = STATE_COORDS.get(user.get("state","Other"), STATE_COORDS["Other"])
+                weather_data = get_weather_data(*coords)
+                if weather_data and 'current_weather' in weather_data:
+                    cw = weather_data['current_weather']
+                    temp = cw.get('temperature','N/A')
+                    prec = cw.get('precipitation', cw.get('rain',0) or 0)
+                    st.markdown(f"**Current Temperature:** {temp}°C | **Precipitation:** {prec}mm")
+                    suggested_crop = suggest_crop_from_weather(weather_data)
+                    st.markdown(f"**Recommended Crop:** {suggested_crop}")
+                    st.markdown("**Reason:** Based on regional weather and typical crop suitability.")
+                else:
+                    st.markdown("Weather data not available for your location.")
+                st.markdown("**Modern Techniques:**")
+                st.markdown("- Drip irrigation\n- Organic fertilization\n- Integrated Pest Management (IPM)\n- Soil testing & balanced fertilizer use")
+                st.video("https://www.youtube.com/watch?v=FzC1LPXxYDM")
+
             elif page=="Government Schemes":
                 st.markdown("<div class='title'>🏛️ Government Schemes</div>", unsafe_allow_html=True)
                 schemes = [
@@ -275,24 +312,24 @@ else:
                 for s in schemes:
                     st.markdown(f"- {s}")
 
-# ------------------- OFFICIAL -------------------
+        # Official pages
         else:
             if page=="Logout":
                 st.session_state.user = None
                 st.rerun()
-            
+
             elif page=="Pending Verifications":
                 st.markdown("<div class='title'>📋 Pending Verifications</div>", unsafe_allow_html=True)
                 pending = df[df['verified']=="Pending"]
                 if pending.empty:
                     st.info("No pending records.")
                 else:
-                    for idx,r in pending.iterrows():
+                    for idx, r in pending.iterrows():
                         st.markdown(f"**Farmer:** {r['farmer_name']} | Crop: {r['detected_crop']} | Health: {r['detected_health']}")
                         imgpath = os.path.join(DATA_DIR, r['image_name']) if r['image_name'] else None
                         if imgpath and os.path.exists(imgpath):
-                            st.image(imgpath, width=250)
-                        col1,col2 = st.columns([1,1])
+                            st.image(imgpath, width=300)
+                        col1, col2 = st.columns([1,1])
                         with col1:
                             if st.button(f"Verify {r['submission_id']}", key=f"v{r['submission_id']}"):
                                 df.loc[idx,'verified']="Verified"
@@ -309,11 +346,12 @@ else:
                                 save_subs(df)
                                 st.error("Rejected")
                                 st.rerun()
-            
+
             elif page=="Verified Records":
                 st.markdown("<div class='title'>✅ Verified Records</div>", unsafe_allow_html=True)
                 verified = df[df['verified']=="Verified"]
                 if verified.empty:
                     st.info("No verified records yet.")
                 else:
-                    st.dataframe(verified)
+                    st.dataframe(verified.reset_index(drop=True))
+# --- end ---
