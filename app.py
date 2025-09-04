@@ -127,7 +127,7 @@ def suggest_crop_from_weather(weather_data):
 # --- CSS / styling (preserve your UI look) ---
 st.markdown("""
 <style>
-* { color: #0B3D0B !important; font-weight: 700 !important; }
+* { color: #00c400 !important; font-weight: 700 !important; }
 .stTextInput input, .stTextArea textarea, .stSelectbox select, .stFileUploader input {
     color: #ffffff !important;
     background-color: #0B3D0B !important;
