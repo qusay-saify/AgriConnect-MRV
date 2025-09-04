@@ -30,6 +30,7 @@ pip install -r requirements.txt
 3 Run the app
 streamlit run app.py
 
+---
 
 ## System Workflow Flowchart 
 
